@@ -1,0 +1,699 @@
+import { describe, expect, it } from "vitest";
+import { appRouter } from "./routers";
+import { COOKIE_NAME } from "../shared/const";
+import type { TrpcContext } from "./_core/context";
+
+type CookieCall = {
+  name: string;
+  options: Record<string, unknown>;
+};
+
+type AuthenticatedUser = NonNullable<TrpcContext["user"]>;
+
+function createAuthContext(): { ctx: TrpcContext; clearedCookies: CookieCall[] } {
+  const clearedCookies: CookieCall[] = [];
+
+  const user: AuthenticatedUser = {
+    id: 1,
+    openId: "sample-user",
+    email: "sample@example.com",
+    name: "Sample User",
+    loginMethod: "manus",
+    role: "user",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    lastSignedIn: new Date(),
+  };
+
+  const ctx: TrpcContext = {
+    user,
+    req: {
+      protocol: "https",
+      headers: {},
+    } as TrpcContext["req"],
+    res: {
+      clearCookie: (name: string, options: Record<string, unknown>) => {
+        clearedCookies.push({ name, options });
+      },
+    } as TrpcContext["res"],
+  };
+
+  return { ctx, clearedCookies };
+}
+
+describe("auth.logout", () => {
+  it("clears the session cookie and reports success", async () => {
+    const { ctx, clearedCookies } = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.auth.logout();
+
+    expect(result).toEqual({ success: true });
+    expect(clearedCookies).toHaveLength(1);
+    expect(clearedCookies[0]?.name).toBe(COOKIE_NAME);
+    expect(clearedCookies[0]?.options).toMatchObject({
+      maxAge: -1,
+      secure: true,
+      sameSite: "none",
+      httpOnly: true,
+      path: "/",
+    });
+  });
+});
+
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/mysql2";
+import { InsertUser, users, generations, assets, userPreferences, InsertGeneration, InsertAsset, InsertUserPreference } from "../drizzle/schema";
+import { ENV } from './_core/env';
+
+let _db: ReturnType<typeof drizzle> | null = null;
+
+// Lazily create the drizzle instance so local tooling can run without a DB.
+export async function getDb() {
+  if (!_db && process.env.DATABASE_URL) {
+    try {
+      _db = drizzle(process.env.DATABASE_URL);
+    } catch (error) {
+      console.warn("[Database] Failed to connect:", error);
+      _db = null;
+    }
+  }
+  return _db;
+}
+
+export async function upsertUser(user: InsertUser): Promise<void> {
+  if (!user.openId) {
+    throw new Error("User openId is required for upsert");
+  }
+
+  const db = await getDb();
+  if (!db) {
+    console.warn("[Database] Cannot upsert user: database not available");
+    return;
+  }
+
+  try {
+    const values: InsertUser = {
+      openId: user.openId,
+    };
+    const updateSet: Record<string, unknown> = {};
+
+    const textFields = ["name", "email", "loginMethod"] as const;
+    type TextField = (typeof textFields)[number];
+
+    const assignNullable = (field: TextField) => {
+      const value = user[field];
+      if (value === undefined) return;
+      const normalized = value ?? null;
+      values[field] = normalized;
+      updateSet[field] = normalized;
+    };
+
+    textFields.forEach(assignNullable);
+
+    if (user.lastSignedIn !== undefined) {
+      values.lastSignedIn = user.lastSignedIn;
+      updateSet.lastSignedIn = user.lastSignedIn;
+    }
+    if (user.role !== undefined) {
+      values.role = user.role;
+      updateSet.role = user.role;
+    } else if (user.openId === ENV.ownerOpenId) {
+      values.role = 'admin';
+      updateSet.role = 'admin';
+    }
+
+    if (!values.lastSignedIn) {
+      values.lastSignedIn = new Date();
+    }
+
+    if (Object.keys(updateSet).length === 0) {
+      updateSet.lastSignedIn = new Date();
+    }
+
+    await db.insert(users).values(values).onDuplicateKeyUpdate({
+      set: updateSet,
+    });
+  } catch (error) {
+    console.error("[Database] Failed to upsert user:", error);
+    throw error;
+  }
+}
+
+export async function getUserByOpenId(openId: string) {
+  const db = await getDb();
+  if (!db) {
+    console.warn("[Database] Cannot get user: database not available");
+    return undefined;
+  }
+
+  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
+
+  return result.length > 0 ? result[0] : undefined;
+}
+
+// Generation queries
+export async function createGeneration(generation: InsertGeneration) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  const result = await db.insert(generations).values(generation);
+  return result;
+}
+
+export async function getGenerationById(id: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  const result = await db.select().from(generations).where(eq(generations.id, id)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+export async function getUserGenerations(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  const result = await db.select().from(generations).where(eq(generations.userId, userId)).orderBy(generations.createdAt);
+  return result;
+}
+
+export async function updateGenerationStatus(
+  id: number,
+  status: string,
+  progressPercent?: number,
+  outputUrl?: string,
+  outputKey?: string,
+  outputType?: string
+) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  const updateData: any = { status, updatedAt: new Date() };
+  if (progressPercent !== undefined) updateData.progressPercent = progressPercent;
+  if (outputUrl !== undefined) updateData.outputUrl = outputUrl;
+  if (outputKey !== undefined) updateData.outputKey = outputKey;
+  if (outputType !== undefined) updateData.outputType = outputType;
+  if (status === "completed") updateData.completedAt = new Date();
+  
+  await db.update(generations).set(updateData).where(eq(generations.id, id));
+}
+
+// Asset queries
+export async function createAsset(asset: InsertAsset) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  const result = await db.insert(assets).values(asset);
+  return result;
+}
+
+export async function getUserAssets(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  const result = await db.select().from(assets).where(eq(assets.userId, userId)).orderBy(assets.createdAt);
+  return result;
+}
+
+export async function deleteAsset(id: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  await db.delete(assets).where(eq(assets.id, id));
+}
+
+// User preferences
+export async function getUserPreferences(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  const result = await db.select().from(userPreferences).where(eq(userPreferences.userId, userId)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+export async function createUserPreferences(prefs: InsertUserPreference) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  await db.insert(userPreferences).values(prefs);
+}
+
+export async function updateUserPreferences(userId: number, updates: Partial<InsertUserPreference>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  
+  await db.update(userPreferences).set(updates).where(eq(userPreferences.userId, userId));
+}
+
+import { describe, expect, it, beforeEach } from "vitest";
+import { appRouter } from "./routers";
+import type { TrpcContext } from "./_core/context";
+
+type AuthenticatedUser = NonNullable<TrpcContext["user"]>;
+
+function createAuthContext(userId: number = 1): TrpcContext {
+  const user: AuthenticatedUser = {
+    id: userId,
+    openId: `user-${userId}`,
+    email: `user${userId}@example.com`,
+    name: `Test User ${userId}`,
+    loginMethod: "manus",
+    role: "user",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    lastSignedIn: new Date(),
+  };
+
+  const ctx: TrpcContext = {
+    user,
+    req: {
+      protocol: "https",
+      headers: {},
+    } as TrpcContext["req"],
+    res: {
+      clearCookie: () => {},
+    } as TrpcContext["res"],
+  };
+
+  return ctx;
+}
+
+describe("generation procedures", () => {
+  it("should create a generation job", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.generation.create({
+      toolType: "image-to-video",
+      inputData: JSON.stringify({
+        motionPrompt: "Camera pans left to right",
+        duration: 5,
+      }),
+    });
+
+    expect(result).toBeDefined();
+  });
+
+  it("should list user generations", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.generation.list();
+    expect(Array.isArray(result)).toBe(true);
+  });
+
+  it("should update generation status", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    // Create a generation first
+    const created = await caller.generation.create({
+      toolType: "text-to-video",
+      inputData: JSON.stringify({
+        textPrompt: "A beautiful sunset",
+        duration: 5,
+      }),
+    });
+
+    // Update its status
+    const result = await caller.generation.updateStatus({
+      generationId: 1,
+      status: "processing",
+      progressPercent: 50,
+    });
+
+    expect(result.success).toBe(true);
+  });
+});
+
+describe("asset procedures", () => {
+  it("should create an asset", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.asset.create({
+      assetType: "video",
+      toolType: "image-to-video",
+      storageUrl: "https://example.com/video.mp4",
+      storageKey: "video-123",
+      fileName: "animation.mp4",
+      mimeType: "video/mp4",
+      fileSizeBytes: 5242880,
+      title: "Mountain Animation",
+    });
+
+    expect(result).toBeDefined();
+  });
+
+  it("should list user assets", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.asset.list();
+    expect(Array.isArray(result)).toBe(true);
+  });
+
+  it("should delete an asset", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.asset.delete({
+      assetId: 1,
+    });
+
+    expect(result.success).toBe(true);
+  });
+});
+
+describe("user preferences", () => {
+  it("should get or create user preferences", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.preferences.get();
+    expect(result).toBeDefined();
+    expect(result?.defaultDuration).toBe(5);
+    expect(result?.defaultStyle).toBe("cinematic");
+  });
+});
+
+
+import { exec } from "child_process";
+import { promisify } from "util";
+import fs from "fs/promises";
+import path from "path";
+import { storagePut } from "./storage";
+
+const execAsync = promisify(exec);
+
+export async function generateMockVideo(title: string): Promise<{ url: string; key: string }> {
+  const tempDir = "/tmp/ai-studio-mocks";
+  await fs.mkdir(tempDir, { recursive: true });
+  const fileName = `mock_${Date.now()}.mp4`;
+  const filePath = path.join(tempDir, fileName);
+
+  // Generate a 5-second video with text using ffmpeg
+  const command = `ffmpeg -f lavfi -i color=c=blue:s=1280x720:d=5 -vf "drawtext=text='${title}':fontcolor=white:fontsize=50:x=(w-text_w)/2:y=(h-text_h)/2" -c:v libx264 -t 5 -pix_fmt yuv420p "${filePath}"`;
+  
+  try {
+    await execAsync(command);
+    const videoBuffer = await fs.readFile(filePath);
+    const result = await storagePut(fileName, videoBuffer, "video/mp4");
+    
+    // Cleanup
+    await fs.unlink(filePath);
+    
+    return result;
+  } catch (error) {
+    console.error("FFmpeg error:", error);
+    // Fallback to a static URL if ffmpeg fails
+    return {
+      url: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+      key: "fallback-video"
+    };
+  }
+}
+
+export async function generateMockImage(title: string): Promise<{ url: string; key: string }> {
+  const tempDir = "/tmp/ai-studio-mocks";
+  await fs.mkdir(tempDir, { recursive: true });
+  const fileName = `mock_${Date.now()}.jpg`;
+  const filePath = path.join(tempDir, fileName);
+
+  // Generate a simple image with text using ffmpeg (since it's already there)
+  const command = `ffmpeg -f lavfi -i color=c=orange:s=1280x720:d=1 -frames:v 1 -vf "drawtext=text='${title}':fontcolor=white:fontsize=50:x=(w-text_w)/2:y=(h-text_h)/2" "${filePath}"`;
+
+  try {
+    await execAsync(command);
+    const imageBuffer = await fs.readFile(filePath);
+    const result = await storagePut(fileName, imageBuffer, "image/jpeg");
+    
+    // Cleanup
+    await fs.unlink(filePath);
+    
+    return result;
+  } catch (error) {
+    console.error("FFmpeg error:", error);
+    // Fallback to a static URL if ffmpeg fails
+    return {
+      url: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1920&auto=format&fit=crop",
+      key: "fallback-image"
+    };
+  }
+}
+
+import { COOKIE_NAME } from "@shared/const";
+import { getSessionCookieOptions } from "./_core/cookies";
+import { systemRouter } from "./_core/systemRouter";
+import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
+import { z } from "zod";
+import {
+  createGeneration,
+  getUserGenerations,
+  updateGenerationStatus,
+  getUserAssets,
+  createAsset,
+  deleteAsset,
+  getUserPreferences,
+  createUserPreferences,
+} from "./db";
+import { generateMockVideo, generateMockImage } from "./mockGenerator";
+
+export const appRouter = router({
+  system: systemRouter,
+  auth: router({
+    me: publicProcedure.query(opts => opts.ctx.user),
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return {
+        success: true,
+      } as const;
+    }),
+  }),
+
+  // Generation procedures
+  generation: router({
+    create: protectedProcedure
+      .input(
+        z.object({
+          toolType: z.enum(["image-to-video", "virtual-try-on", "text-to-video", "video-upscale"]),
+          inputData: z.string(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        const result = await createGeneration({
+          userId: ctx.user.id,
+          toolType: input.toolType,
+          status: "pending",
+          inputData: input.inputData,
+        });
+        return result;
+      }),
+
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return await getUserGenerations(ctx.user.id);
+    }),
+
+    updateStatus: protectedProcedure
+      .input(
+        z.object({
+          generationId: z.number(),
+          status: z.enum(["pending", "processing", "completed", "failed"]),
+          progressPercent: z.number().optional(),
+          outputUrl: z.string().optional(),
+          outputKey: z.string().optional(),
+          outputType: z.enum(["image", "video"]).optional(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        await updateGenerationStatus(
+          input.generationId,
+          input.status,
+          input.progressPercent,
+          input.outputUrl,
+          input.outputKey,
+          input.outputType
+        );
+        return { success: true };
+      }),
+
+    generateMock: protectedProcedure
+      .input(
+        z.object({
+          toolType: z.enum(["image-to-video", "virtual-try-on", "text-to-video", "video-upscale"]),
+          title: z.string(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        const isVideo = input.toolType.includes("video") || input.toolType === "image-to-video";
+        if (isVideo) {
+          return await generateMockVideo(input.title);
+        } else {
+          return await generateMockImage(input.title);
+        }
+      }),
+  }),
+
+  // Asset procedures
+  asset: router({
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return await getUserAssets(ctx.user.id);
+    }),
+
+    create: protectedProcedure
+      .input(
+        z.object({
+          assetType: z.enum(["image", "video"]),
+          toolType: z.enum(["image-to-video", "virtual-try-on", "text-to-video", "video-upscale"]),
+          storageUrl: z.string(),
+          storageKey: z.string(),
+          fileName: z.string(),
+          mimeType: z.string().optional(),
+          fileSizeBytes: z.number().optional(),
+          title: z.string().optional(),
+          description: z.string().optional(),
+          generationId: z.number().optional(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        const result = await createAsset({
+          userId: ctx.user.id,
+          assetType: input.assetType,
+          toolType: input.toolType,
+          storageUrl: input.storageUrl,
+          storageKey: input.storageKey,
+          fileName: input.fileName,
+          mimeType: input.mimeType,
+          fileSizeBytes: input.fileSizeBytes,
+          title: input.title,
+          description: input.description,
+          generationId: input.generationId,
+        });
+        return result;
+      }),
+
+    delete: protectedProcedure
+      .input(z.object({ assetId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        await deleteAsset(input.assetId);
+        return { success: true };
+      }),
+  }),
+
+  // User preferences
+  preferences: router({
+    get: protectedProcedure.query(async ({ ctx }) => {
+      let prefs = await getUserPreferences(ctx.user.id);
+      if (!prefs) {
+        await createUserPreferences({
+          userId: ctx.user.id,
+          defaultDuration: 5,
+          defaultStyle: "cinematic",
+        });
+        prefs = await getUserPreferences(ctx.user.id);
+      }
+      return prefs;
+    }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
+
+// Preconfigured storage helpers for Manus WebDev templates
+// Uploads via Forge Server presigned URL to S3 (PUT direct).
+// Downloads return /manus-storage/{key} paths served via 307 redirect.
+
+import { ENV } from "./_core/env";
+
+function getForgeConfig() {
+  const forgeUrl = ENV.forgeApiUrl;
+  const forgeKey = ENV.forgeApiKey;
+
+  if (!forgeUrl || !forgeKey) {
+    throw new Error(
+      "Storage config missing: set BUILT_IN_FORGE_API_URL and BUILT_IN_FORGE_API_KEY",
+    );
+  }
+
+  return { forgeUrl: forgeUrl.replace(/\/+$/, ""), forgeKey };
+}
+
+function normalizeKey(relKey: string): string {
+  return relKey.replace(/^\/+/, "");
+}
+
+function appendHashSuffix(relKey: string): string {
+  const hash = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+  const lastDot = relKey.lastIndexOf(".");
+  if (lastDot === -1) return `${relKey}_${hash}`;
+  return `${relKey.slice(0, lastDot)}_${hash}${relKey.slice(lastDot)}`;
+}
+
+export async function storagePut(
+  relKey: string,
+  data: Buffer | Uint8Array | string,
+  contentType = "application/octet-stream",
+): Promise<{ key: string; url: string }> {
+  const { forgeUrl, forgeKey } = getForgeConfig();
+  const key = appendHashSuffix(normalizeKey(relKey));
+
+  // 1. Get presigned PUT URL from Forge
+  const presignUrl = new URL("v1/storage/presign/put", forgeUrl + "/");
+  presignUrl.searchParams.set("path", key);
+
+  const presignResp = await fetch(presignUrl, {
+    headers: { Authorization: `Bearer ${forgeKey}` },
+  });
+
+  if (!presignResp.ok) {
+    const msg = await presignResp.text().catch(() => presignResp.statusText);
+    throw new Error(`Storage presign failed (${presignResp.status}): ${msg}`);
+  }
+
+  const { url: s3Url } = (await presignResp.json()) as { url: string };
+  if (!s3Url) throw new Error("Forge returned empty presign URL");
+
+  // 2. PUT file directly to S3
+  const blob =
+    typeof data === "string"
+      ? new Blob([data], { type: contentType })
+      : new Blob([data as any], { type: contentType });
+
+  const uploadResp = await fetch(s3Url, {
+    method: "PUT",
+    headers: { "Content-Type": contentType },
+    body: blob,
+  });
+
+  if (!uploadResp.ok) {
+    throw new Error(`Storage upload to S3 failed (${uploadResp.status})`);
+  }
+
+  return { key, url: `/manus-storage/${key}` };
+}
+
+export async function storageGet(relKey: string): Promise<{ key: string; url: string }> {
+  const key = normalizeKey(relKey);
+  return { key, url: `/manus-storage/${key}` };
+}
+
+export async function storageGetSignedUrl(relKey: string): Promise<string> {
+  const { forgeUrl, forgeKey } = getForgeConfig();
+  const key = normalizeKey(relKey);
+
+  const getUrl = new URL("v1/storage/presign/get", forgeUrl + "/");
+  getUrl.searchParams.set("path", key);
+
+  const resp = await fetch(getUrl, {
+    headers: { Authorization: `Bearer ${forgeKey}` },
+  });
+
+  if (!resp.ok) {
+    const msg = await resp.text().catch(() => resp.statusText);
+    throw new Error(`Storage signed URL failed (${resp.status}): ${msg}`);
+  }
+
+  const { url } = (await resp.json()) as { url: string };
+  return url;
+}
